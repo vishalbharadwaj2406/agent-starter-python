@@ -19,6 +19,7 @@ from livekit.agents import (
 )
 from livekit.plugins import noise_cancellation, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
+from rapidfuzz import process, fuzz
 
 logger = logging.getLogger("agent")
 
@@ -106,6 +107,7 @@ SPECIALTY_ALIASES = {
     "bone": "Orthopedic Surgery",
     "bones": "Orthopedic Surgery",
     "orthopedic": "Orthopedic Surgery",
+    "orthopedics": "Orthopedic Surgery",
     "ortho": "Orthopedic Surgery",
     "brain": "Neurology",
     "brain doctor": "Neurology",
@@ -128,6 +130,154 @@ SPECIALTY_ALIASES = {
     "thyroid": "Endocrinology",
 }
 
+# Extract unique values from database for fuzzy matching
+UNIQUE_SPECIALTIES = sorted(set(p["specialty"] for p in PROVIDERS if p.get("specialty")))
+UNIQUE_CITIES = sorted(set(p["address"]["city"] for p in PROVIDERS if p.get("address", {}).get("city")))
+UNIQUE_STATES = sorted(set(p["address"]["state"] for p in PROVIDERS if p.get("address", {}).get("state")))
+
+logger.info(f"Extracted {len(UNIQUE_SPECIALTIES)} unique specialties, {len(UNIQUE_CITIES)} unique cities, {len(UNIQUE_STATES)} unique states")
+
+
+# Fuzzy matching functions
+def fuzzy_match_specialty(input_specialty: str) -> str | None:
+    """
+    Match specialty with typo tolerance using fuzzy matching.
+    
+    Process:
+    1. Check exact match in SPECIALTY_ALIASES (case-insensitive)
+    2. Fuzzy match against database specialties (85% threshold)
+    3. Return matched specialty or original input
+    """
+    if not input_specialty:
+        return None
+    
+    input_lower = input_specialty.lower().strip()
+    
+    # First check exact match in aliases
+    if input_lower in SPECIALTY_ALIASES:
+        logger.info(f"Exact alias match: '{input_specialty}' → '{SPECIALTY_ALIASES[input_lower]}'")
+        return SPECIALTY_ALIASES[input_lower]
+    
+    # Check if exact match exists in database
+    for specialty in UNIQUE_SPECIALTIES:
+        if specialty.lower() == input_lower:
+            logger.info(f"Exact database match: '{input_specialty}' → '{specialty}'")
+            return specialty
+    
+    # Fuzzy match against database specialties
+    result = process.extractOne(
+        input_specialty,
+        UNIQUE_SPECIALTIES,
+        scorer=fuzz.ratio,
+        score_cutoff=85.0
+    )
+    
+    if result:
+        matched_specialty, score, _ = result
+        logger.info(f"Fuzzy matched specialty: '{input_specialty}' → '{matched_specialty}' (score: {score:.1f}%)")
+        return matched_specialty
+    
+    # No match found, return original
+    logger.info(f"No fuzzy match for specialty: '{input_specialty}' (keeping original)")
+    return input_specialty
+
+
+def fuzzy_match_city(input_city: str) -> str | None:
+    """
+    Match city name with typo tolerance using fuzzy matching.
+    
+    Process:
+    1. Check exact match (case-insensitive)
+    2. Fuzzy match against database cities (85% threshold)
+    3. Return matched city or original input
+    """
+    if not input_city:
+        return None
+    
+    input_lower = input_city.lower().strip()
+    
+    # Check if exact match exists in database
+    for city in UNIQUE_CITIES:
+        if city.lower() == input_lower:
+            logger.info(f"Exact city match: '{input_city}' → '{city}'")
+            return city
+    
+    # Fuzzy match against database cities
+    result = process.extractOne(
+        input_city,
+        UNIQUE_CITIES,
+        scorer=fuzz.ratio,
+        score_cutoff=85.0
+    )
+    
+    if result:
+        matched_city, score, _ = result
+        logger.info(f"Fuzzy matched city: '{input_city}' → '{matched_city}' (score: {score:.1f}%)")
+        return matched_city
+    
+    # No match found, return original
+    logger.info(f"No fuzzy match for city: '{input_city}' (keeping original)")
+    return input_city
+
+
+def fuzzy_match_state(input_state: str) -> str | None:
+    """
+    Match state with typo tolerance using fuzzy matching.
+    
+    Process:
+    1. Check exact match in STATE_ABBREV_MAP (case-insensitive)
+    2. Fuzzy match against state names (85% threshold)
+    3. Fuzzy match against state abbreviations (85% threshold)
+    4. Return matched state abbreviation or original input
+    """
+    if not input_state:
+        return None
+    
+    input_lower = input_state.lower().strip()
+    
+    # First check exact match in state abbreviation map
+    if input_lower in STATE_ABBREV_MAP:
+        logger.info(f"Exact state name match: '{input_state}' → '{STATE_ABBREV_MAP[input_lower]}'")
+        return STATE_ABBREV_MAP[input_lower]
+    
+    # Check if it's already a valid abbreviation
+    input_upper = input_state.upper().strip()
+    if input_upper in UNIQUE_STATES:
+        logger.info(f"Valid state abbreviation: '{input_state}' → '{input_upper}'")
+        return input_upper
+    
+    # Fuzzy match against full state names (lower threshold for short names)
+    state_names = list(STATE_ABBREV_MAP.keys())
+    result = process.extractOne(
+        input_state.lower(),
+        state_names,
+        scorer=fuzz.ratio,
+        score_cutoff=75.0
+    )
+    
+    if result:
+        matched_state_name, score, _ = result
+        matched_abbrev = STATE_ABBREV_MAP[matched_state_name]
+        logger.info(f"Fuzzy matched state name: '{input_state}' → '{matched_state_name}' → '{matched_abbrev}' (score: {score:.1f}%)")
+        return matched_abbrev
+    
+    # Fuzzy match against state abbreviations (lower threshold for short names)
+    result = process.extractOne(
+        input_state.upper(),
+        UNIQUE_STATES,
+        scorer=fuzz.ratio,
+        score_cutoff=75.0
+    )
+    
+    if result:
+        matched_abbrev, score, _ = result
+        logger.info(f"Fuzzy matched state abbreviation: '{input_state}' → '{matched_abbrev}' (score: {score:.1f}%)")
+        return matched_abbrev
+    
+    # No match found, return original
+    logger.info(f"No fuzzy match for state: '{input_state}' (keeping original)")
+    return input_state
+
 
 class Assistant(Agent):
     def __init__(self) -> None:
@@ -145,8 +295,8 @@ class Assistant(Agent):
               1. New searches with different criteria
               2. Refining an existing search with new filters
               3. Re-sorting the results
-            - If a follow-up question is completely unrelated to the previous search (e.g., "What's the weather like?"),
-              ignore the previous search results and answer the new question directly, or initiate a new search if appropriate.
+            - If a follow-up question is completely unrelated to the previous search (e.g., user was searching for cardiologists in Oklahoma, then asks "Find me dentists in California"),
+              ignore the previous search results and initiate the new search.
             
             HANDLING AMBIGUOUS QUERIES:
             - Most search parameters are OPTIONAL. Only ask for clarification if critical information is truly missing.
@@ -243,6 +393,14 @@ class Assistant(Agent):
             "limit": limit,
         }
         logger.info(f"Searching providers with params: {search_params}")
+
+        # Apply fuzzy matching to normalize inputs
+        if city:
+            city = fuzzy_match_city(city)
+        if state:
+            state = fuzzy_match_state(state)
+        if specialty:
+            specialty = fuzzy_match_specialty(specialty)
 
         # Start with all providers
         results = PROVIDERS.copy()
