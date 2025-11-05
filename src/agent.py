@@ -19,25 +19,114 @@ from livekit.agents import (
 )
 from livekit.plugins import noise_cancellation, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
-from mongomock import MongoClient
 
 logger = logging.getLogger("agent")
 
 load_dotenv(".env.local")
 
 # Load provider data at module level
-PROVIDERS_FILE = Path(__file__).parent.parent.parent / "vox-takehome-test" / "data" / "providerlist.json"
+PROVIDERS_FILE = (
+    Path(__file__).parent.parent.parent
+    / "vox-takehome-test"
+    / "data"
+    / "providerlist.json"
+)
 with open(PROVIDERS_FILE, "r") as f:
     PROVIDERS = json.load(f)
 
 logger.info(f"Loaded {len(PROVIDERS)} providers from database")
 
-# Initialize MongoDB collection for querying
-mongo_client = MongoClient()
-db = mongo_client.providers_db
-providers_collection = db.providers
-providers_collection.insert_many(PROVIDERS)
-logger.info(f"Initialized MongoDB collection with {providers_collection.count_documents({})} providers")
+# State name to abbreviation mapping for common conversions
+STATE_ABBREV_MAP = {
+    "alabama": "AL",
+    "alaska": "AK",
+    "arizona": "AZ",
+    "arkansas": "AR",
+    "california": "CA",
+    "colorado": "CO",
+    "connecticut": "CT",
+    "delaware": "DE",
+    "florida": "FL",
+    "georgia": "GA",
+    "hawaii": "HI",
+    "idaho": "ID",
+    "illinois": "IL",
+    "indiana": "IN",
+    "iowa": "IA",
+    "kansas": "KS",
+    "kentucky": "KY",
+    "louisiana": "LA",
+    "maine": "ME",
+    "maryland": "MD",
+    "massachusetts": "MA",
+    "michigan": "MI",
+    "minnesota": "MN",
+    "mississippi": "MS",
+    "missouri": "MO",
+    "montana": "MT",
+    "nebraska": "NE",
+    "nevada": "NV",
+    "new hampshire": "NH",
+    "new jersey": "NJ",
+    "new mexico": "NM",
+    "new york": "NY",
+    "north carolina": "NC",
+    "north dakota": "ND",
+    "ohio": "OH",
+    "oklahoma": "OK",
+    "oregon": "OR",
+    "pennsylvania": "PA",
+    "rhode island": "RI",
+    "south carolina": "SC",
+    "south dakota": "SD",
+    "tennessee": "TN",
+    "texas": "TX",
+    "utah": "UT",
+    "vermont": "VT",
+    "virginia": "VA",
+    "washington": "WA",
+    "west virginia": "WV",
+    "wisconsin": "WI",
+    "wyoming": "WY",
+}
+
+# Specialty aliases for common/colloquial terms
+SPECIALTY_ALIASES = {
+    "heart": "Cardiology",
+    "heart doctor": "Cardiology",
+    "cardiologist": "Cardiology",
+    "cancer": "Oncology",
+    "cancer doctor": "Oncology",
+    "oncologist": "Oncology",
+    "eye": "Ophthalmology",
+    "eye doctor": "Ophthalmology",
+    "eyes": "Ophthalmology",
+    "skin": "Dermatology",
+    "skin doctor": "Dermatology",
+    "bone": "Orthopedic Surgery",
+    "bones": "Orthopedic Surgery",
+    "orthopedic": "Orthopedic Surgery",
+    "ortho": "Orthopedic Surgery",
+    "brain": "Neurology",
+    "brain doctor": "Neurology",
+    "neurologist": "Neurology",
+    "stomach": "Gastroenterology",
+    "digestive": "Gastroenterology",
+    "kidney": "Nephrology",
+    "kidneys": "Nephrology",
+    "baby": "Pediatrics",
+    "babies": "Pediatrics",
+    "kids": "Pediatrics",
+    "children": "Pediatrics",
+    "child": "Pediatrics",
+    "obgyn": "Obstetrics and Gynecology",
+    "ob-gyn": "Obstetrics and Gynecology",
+    "ob/gyn": "Obstetrics and Gynecology",
+    "women": "Obstetrics and Gynecology",
+    "diabetes": "Endocrinology",
+    "hormone": "Endocrinology",
+    "thyroid": "Endocrinology",
+}
 
 
 class Assistant(Agent):
@@ -45,7 +134,25 @@ class Assistant(Agent):
         super().__init__(
             instructions="""You are a helpful healthcare provider search assistant. The user is interacting with you via voice, even if you perceive the conversation as text.
             You help users find doctors and healthcare providers based on their needs such as location, specialty, insurance, and availability.
+            
             When users ask about doctors, providers, or medical professionals, use the available search tool to find matching providers.
+            
+            IMPORTANT CONTEXT MANAGEMENT:
+            - The 'search_providers' tool returns complete provider information. After calling, all data stays in conversation context.
+            - For follow-up questions about providers already found (e.g., "What insurance does she accept?", "Tell me more about the first one"),
+              answer from context WITHOUT calling the tool again.
+            - Only call the 'search_providers' tool for:
+              1. New searches with different criteria
+              2. Refining an existing search with new filters
+              3. Re-sorting the results
+            - If a follow-up question is completely unrelated to the previous search (e.g., "What's the weather like?"),
+              ignore the previous search results and answer the new question directly, or initiate a new search if appropriate.
+            
+            HANDLING AMBIGUOUS QUERIES:
+            - If a query is ambiguous or missing key information (e.g., "doctors near me" without a city), 
+              ask the user for clarification before searching.
+            - Be proactive in asking for the most relevant details: city, specialty, insurance needs, etc.
+            
             Your responses are concise, to the point, and without any complex formatting or punctuation including emojis, asterisks, or other symbols.
             You are friendly, professional, and helpful.""",
         )
@@ -54,148 +161,242 @@ class Assistant(Agent):
     async def search_providers(
         self,
         context: RunContext,
-        query: str,
+        # Location filters
+        city: str | None = None,
+        state: str | None = None,
+        # Provider attributes
+        specialty: str | None = None,
+        languages: str | list[str] | None = None,  # Support multiple
+        # Insurance & availability
+        insurance: str | list[str] | None = None,  # Support multiple (OR logic)
+        accepting_new_patients: bool | None = None,
+        # Quality filters
+        min_rating: float | None = None,
+        max_rating: float | None = None,
+        board_certified: bool | None = None,
+        min_years_experience: int | None = None,
+        max_years_experience: int | None = None,
+        # Sorting & limiting
+        sort_by: str | list[str] | None = None,  # Support multi-level sorting
+        sort_order: str = "desc",  # Applied to all sort fields
         limit: int = 5,
     ):
-        """Search for healthcare providers using MongoDB query syntax.
+        """
+        Search for healthcare providers based on various criteria.
 
-        Use this tool to search for doctors and healthcare providers. Construct MongoDB queries
-        to filter by any field in the provider database.
+        IMPORTANT: This tool returns complete provider information. After calling,
+        all data stays in conversation context. For follow-up questions about
+        providers already found, answer from context WITHOUT calling this tool again.
+        Only call this tool for new searches, to refine an existing search with new filters,
+        or to re-sort the results. If a follow-up question is completely unrelated to the
+        previous search, the LLM should ignore the previous results and initiate a new search
+        if appropriate, or answer directly if it's a general knowledge question.
 
-        IMPORTANT NORMALIZATION RULES:
-        - Abbreviations: Convert "SF" to "San Francisco", "NYC" to "New York City", "LA" to "Los Angeles"
-        - For partial text matching: Use regex with case-insensitive option: {"specialty": {"$regex": "Surgery", "$options": "i"}}
-        - The system handles nested fields with dot notation: "address.city", "address.state"
-
-        Common MongoDB Operators:
-        - Equality: {"field": "value"}
-        - Regex/Contains: {"field": {"$regex": "pattern", "$options": "i"}}
-        - Comparison: {"field": {"$gt": value, "$gte": value, "$lt": value, "$lte": value}}
-        - In array: {"field": {"$in": ["value1", "value2"]}}
-        - Element in array field: {"insurance_accepted": {"$elemMatch": {"$regex": "Medicare", "$options": "i"}}}
-        - Logical: {"$and": [...], "$or": [...], "$not": {...}}
-
-        Available fields:
-        - full_name, specialty, phone, email
-        - address.city, address.state, address.street, address.zip
-        - rating (number), years_experience (number)
-        - accepting_new_patients (boolean), board_certified (boolean)
-        - insurance_accepted (array of strings), languages (array of strings)
-
-        Query Examples:
-        1. City search (normalize abbreviations!):
-           {"address.city": "San Francisco"}
-
-        2. Specialty with partial match:
-           {"specialty": {"$regex": "Surgery", "$options": "i"}}
-
-        3. Rating filter:
-           {"rating": {"$gte": 4.5}}
-
-        4. Multiple conditions (AND):
-           {"$and": [{"address.city": "Dallas"}, {"specialty": {"$regex": "Cardiology", "$options": "i"}}, {"rating": {"$gte": 4.0}}]}
-
-        5. Multiple conditions (OR):
-           {"$or": [{"specialty": "Cardiology"}, {"specialty": "General Surgery"}]}
-
-        6. Insurance search (array field):
-           {"insurance_accepted": {"$elemMatch": {"$regex": "Medicare", "$options": "i"}}}
-
-        7. Language search (array field):
-           {"languages": "Spanish"}
-
-        8. Complex query:
-           {"$and": [{"address.state": "CA"}, {"board_certified": true}, {"accepting_new_patients": true}, {"rating": {"$gte": 4.0}}]}
+        Examples of when to use this tool:
+        - "Find me a cardiologist in Dallas"
+        - "Are there any doctors in Milwaukee who do general surgery?"
+        - "Show me providers in Oklahoma City"
+        - "Find doctors who accept Blue Cross Blue Shield"
+        - "I need a pediatrician accepting new patients"
+        - "Find me the top 5 highest rated surgeons in Oklahoma"
+        - "Show me doctors who speak Spanish or Mandarin"
+        - "Find providers accepting Medicare or Aetna"
+        - "Board-certified doctors with at least 10 years experience"
 
         Args:
-            query: MongoDB query as a JSON string (e.g., '{"address.city": "Dallas"}')
-            limit: Maximum number of results to return (default 5)
+            city: The city to search in (e.g., "Dallas", "Milwaukee", "Oklahoma City"). Case-insensitive partial matching.
+            state: The state to search in. Accepts full names (e.g., "Oklahoma", "Texas") or abbreviations (e.g., "OK", "TX"). Full names will be automatically converted to abbreviations.
+            specialty: The medical specialty to search for (e.g., "Cardiology", "General Surgery", "Pediatrics"). Case-insensitive partial matching.
+            languages: A single language string (e.g., "Spanish") or a list of languages (e.g., ["Spanish", "Mandarin"]). Providers speaking ANY of the listed languages will be returned. Case-insensitive partial matching.
+            insurance: A single insurance provider string (e.g., "Blue Cross Blue Shield") or a list of providers (e.g., ["Medicare", "Aetna"]). Providers accepting ANY of the listed insurances will be returned. Case-insensitive partial matching.
+            accepting_new_patients: If True, only return providers accepting new patients. If False or None, no filter applied.
+            min_rating: Minimum rating (e.g., 4.0).
+            max_rating: Maximum rating (e.g., 4.5).
+            board_certified: If True, only return board-certified providers. If False or None, no filter applied.
+            min_years_experience: Minimum years of experience.
+            max_years_experience: Maximum years of experience.
+            sort_by: A single field string (e.g., "rating") or a list of fields (e.g., ["rating", "years_experience"]) to sort results by. Supported fields: "rating", "years_experience", "full_name".
+            sort_order: Sort direction for all `sort_by` fields. "desc" for highest/most first, "asc" for lowest/least first (default "desc").
+            limit: Maximum number of results to return (default 5, to keep responses concise).
 
         Returns:
-            On success: Dictionary with "found" count and "providers" list.
-            On no results: Dictionary with suggestions for alternative searches.
+            On success: Dictionary with "found" count, "search_metadata", and "providers" list containing full provider details.
+            On no results: Dictionary with helpful suggestions including available specialties in the city or cities where the specialty exists.
         """
-        logger.info(f"Searching providers with query: {query}, limit: {limit}")
+        # Log search parameters
+        search_params = {
+            "city": city,
+            "state": state,
+            "specialty": specialty,
+            "languages": languages,
+            "insurance": insurance,
+            "accepting_new_patients": accepting_new_patients,
+            "min_rating": min_rating,
+            "max_rating": max_rating,
+            "board_certified": board_certified,
+            "min_years_experience": min_years_experience,
+            "max_years_experience": max_years_experience,
+            "sort_by": sort_by,
+            "sort_order": sort_order,
+            "limit": limit,
+        }
+        logger.info(f"Searching providers with params: {search_params}")
 
-        try:
-            # Parse the JSON query string
-            try:
-                query_dict = json.loads(query)
-                logger.info(f"Parsed query: {query_dict}")
-            except json.JSONDecodeError as e:
-                logger.error(f"Invalid JSON query: {query}, error: {e}")
-                return {
-                    "found": 0,
-                    "error": f"Invalid JSON query format: {str(e)}",
-                    "message": "Please provide a valid JSON query string."
-                }
+        # Start with all providers
+        results = PROVIDERS.copy()
 
-            # Execute MongoDB query
-            cursor = providers_collection.find(query_dict).limit(limit)
-            results = list(cursor)
+        # String filters - case-insensitive partial matching
+        if city:
+            results = [
+                p for p in results if city.lower() in p["address"]["city"].lower()
+            ]
+        if state:
+            # Convert full state names to abbreviations if needed
+            state_search = STATE_ABBREV_MAP.get(state.lower(), state)
+            results = [
+                p
+                for p in results
+                if state_search.lower() in p["address"]["state"].lower()
+            ]
+        if specialty:
+            # Convert alias to actual specialty (e.g., "heart" -> "Cardiology")
+            specialty_search = SPECIALTY_ALIASES.get(specialty.lower(), specialty)
+            results = [
+                p for p in results if specialty_search.lower() in p["specialty"].lower()
+            ]
 
-            logger.info(f"Found {len(results)} matching providers")
+        # List parameters - OR logic
+        if languages:
+            if isinstance(languages, list):
+                results = [
+                    p
+                    for p in results
+                    if any(
+                        any(lang.lower() in plang.lower() for plang in p["languages"])
+                        for lang in languages
+                    )
+                ]
+            else:
+                results = [
+                    p
+                    for p in results
+                    if any(
+                        languages.lower() in plang.lower() for plang in p["languages"]
+                    )
+                ]
 
-            # Handle empty results with suggestions
-            if not results:
-                suggestions = {}
+        if insurance:
+            if isinstance(insurance, list):
+                results = [
+                    p
+                    for p in results
+                    if any(
+                        any(
+                            ins.lower() in acc.lower()
+                            for acc in p["insurance_accepted"]
+                        )
+                        for ins in insurance
+                    )
+                ]
+            else:
+                results = [
+                    p
+                    for p in results
+                    if any(
+                        insurance.lower() in acc.lower()
+                        for acc in p["insurance_accepted"]
+                    )
+                ]
 
-                # Extract city from query if present
-                city = query_dict.get("address.city")
-                if not city and "$and" in query_dict:
-                    for condition in query_dict["$and"]:
-                        if "address.city" in condition:
-                            city = condition["address.city"]
-                            break
+        # Boolean filters
+        if accepting_new_patients is not None:
+            results = [
+                p
+                for p in results
+                if p["accepting_new_patients"] == accepting_new_patients
+            ]
+        if board_certified is not None:
+            results = [p for p in results if p["board_certified"] == board_certified]
 
-                # Extract specialty from query if present
-                specialty = None
-                if "specialty" in query_dict:
-                    if isinstance(query_dict["specialty"], dict) and "$regex" in query_dict["specialty"]:
-                        specialty = query_dict["specialty"]["$regex"]
-                    else:
-                        specialty = query_dict["specialty"]
-                elif "$and" in query_dict:
-                    for condition in query_dict["$and"]:
-                        if "specialty" in condition:
-                            if isinstance(condition["specialty"], dict) and "$regex" in condition["specialty"]:
-                                specialty = condition["specialty"]["$regex"]
-                            else:
-                                specialty = condition["specialty"]
-                            break
+        # Numeric range filters
+        if min_rating is not None:
+            results = [p for p in results if p["rating"] >= min_rating]
+        if max_rating is not None:
+            results = [p for p in results if p["rating"] <= max_rating]
+        if min_years_experience is not None:
+            results = [
+                p for p in results if p["years_experience"] >= min_years_experience
+            ]
+        if max_years_experience is not None:
+            results = [
+                p for p in results if p["years_experience"] <= max_years_experience
+            ]
 
-                # Provide suggestions for city
-                if city:
-                    city_providers = list(providers_collection.find({"address.city": city}))
-                    if city_providers:
-                        available_specialties = sorted(set(p["specialty"] for p in city_providers))
-                        suggestions["available_in_city"] = available_specialties
-                        suggestions["city"] = city
-                    else:
-                        # City not found
-                        all_cities = sorted(set(p["address"]["city"] for p in PROVIDERS))
-                        suggestions["available_cities"] = all_cities[:10]
+        # Sorting
+        if sort_by and results:
+            reverse = sort_order == "desc"
+            if isinstance(sort_by, list):
+                # Multi-level sorting: apply in reverse order so first field has priority
+                for field in reversed(sort_by):
+                    results = sorted(
+                        results, key=lambda p: p.get(field, 0), reverse=reverse
+                    )
+            else:
+                results = sorted(
+                    results, key=lambda p: p.get(sort_by, 0), reverse=reverse
+                )
 
-                # Provide suggestions for specialty
-                if specialty:
-                    specialty_query = {"specialty": {"$regex": specialty, "$options": "i"}}
-                    specialty_providers = list(providers_collection.find(specialty_query))
-                    if specialty_providers:
-                        cities_with_specialty = sorted(set(p["address"]["city"] for p in specialty_providers))
-                        suggestions["cities_with_specialty"] = cities_with_specialty
-                        suggestions["matching_specialty"] = specialty_providers[0]["specialty"]
+        # Apply limit
+        results = results[:limit]
 
-                return {
-                    "found": 0,
-                    "message": "No providers found matching your search criteria.",
-                    "query": query_dict,
-                    "suggestions": suggestions
-                }
+        logger.info(f"Found {len(results)} matching providers")
 
-            # Format results
-            formatted_results = []
-            for provider in results:
-                formatted_results.append({
+        # Handle empty results with suggestions
+        if not results:
+            suggestions = {}
+
+            # Provide suggestions for city
+            if city:
+                city_providers = [
+                    p for p in PROVIDERS if city.lower() in p["address"]["city"].lower()
+                ]
+                if city_providers:
+                    available_specialties = sorted(
+                        set(p["specialty"] for p in city_providers)
+                    )
+                    suggestions["available_in_city"] = available_specialties
+                    suggestions["city"] = city
+                else:
+                    # City not found
+                    all_cities = sorted(set(p["address"]["city"] for p in PROVIDERS))
+                    suggestions["available_cities"] = all_cities[:10]
+
+            # Provide suggestions for specialty
+            if specialty:
+                specialty_providers = [
+                    p for p in PROVIDERS if specialty.lower() in p["specialty"].lower()
+                ]
+                if specialty_providers:
+                    cities_with_specialty = sorted(
+                        set(p["address"]["city"] for p in specialty_providers)
+                    )
+                    suggestions["cities_with_specialty"] = cities_with_specialty
+                    suggestions["matching_specialty"] = specialty_providers[0][
+                        "specialty"
+                    ]
+
+            return {
+                "found": 0,
+                "message": "No providers found matching your search criteria.",
+                "suggestions": suggestions,
+            }
+
+        # Format results with full provider information
+        formatted_results = []
+        for i, provider in enumerate(results):
+            formatted_results.append(
+                {
+                    "id": f"prov_{i}",
                     "name": provider["full_name"],
                     "specialty": provider["specialty"],
                     "phone": provider["phone"],
@@ -203,23 +404,40 @@ class Assistant(Agent):
                     "address": f"{provider['address']['street']}, {provider['address']['city']}, {provider['address']['state']} {provider['address']['zip']}",
                     "city": provider["address"]["city"],
                     "state": provider["address"]["state"],
-                    "accepting_new_patients": provider["accepting_new_patients"],
-                    "insurance_accepted": provider["insurance_accepted"],
                     "rating": provider["rating"],
                     "years_experience": provider["years_experience"],
+                    "accepting_new_patients": provider["accepting_new_patients"],
                     "board_certified": provider["board_certified"],
+                    "insurance_accepted": provider["insurance_accepted"],
                     "languages": provider["languages"],
-                })
+                }
+            )
 
-            return {"found": len(formatted_results), "providers": formatted_results}
-
-        except Exception as e:
-            logger.error(f"Error executing query: {e}")
-            return {
-                "found": 0,
-                "error": f"Invalid query format: {str(e)}",
-                "message": "Please use valid MongoDB query syntax."
-            }
+        return {
+            "found": len(formatted_results),
+            "search_metadata": {
+                "filters_applied": {
+                    k: v
+                    for k, v in {
+                        "city": city,
+                        "state": state,
+                        "specialty": specialty,
+                        "insurance": insurance,
+                        "languages": languages,
+                        "min_rating": min_rating,
+                        "max_rating": max_rating,
+                        "board_certified": board_certified,
+                        "min_years_experience": min_years_experience,
+                        "max_years_experience": max_years_experience,
+                        "sort_by": sort_by,
+                        "sort_order": sort_order,
+                    }.items()
+                    if v is not None
+                },
+                "total_in_db": len(PROVIDERS),
+            },
+            "providers": formatted_results,
+        }
 
 
 def prewarm(proc: JobProcess):
